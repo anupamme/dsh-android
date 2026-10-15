@@ -408,7 +408,38 @@ public final class BridgeServer {
                     int port = request.optInt("port", app.port());
                     editor.putInt("port", port < 1 || port > 65535 ? 3080 : port);
                 }
-                if (request.has("apiKey")) editor.putString("apiKey", request.optString("apiKey", ""));
+                if (request.has("apiKey")) {
+                    // CWE-312: never persist the DeepSeek API key as plaintext in
+                    // SharedPreferences. Encrypt it with an AES-GCM key held in the
+                    // Android Keystore, which rooted-device/backup extraction cannot
+                    // read out (the key material never leaves the secure hardware).
+                    String rawApiKey = request.optString("apiKey", "");
+                    String encApiKey = "";
+                    try {
+                        java.security.KeyStore ks = java.security.KeyStore.getInstance("AndroidKeyStore");
+                        ks.load(null);
+                        if (!ks.containsAlias("dsh_apikey")) {
+                            javax.crypto.KeyGenerator kg = javax.crypto.KeyGenerator.getInstance("AES", "AndroidKeyStore");
+                            kg.init(new android.security.keystore.KeyGenParameterSpec.Builder("dsh_apikey",
+                                    android.security.keystore.KeyProperties.PURPOSE_ENCRYPT
+                                            | android.security.keystore.KeyProperties.PURPOSE_DECRYPT)
+                                    .setBlockModes("GCM").setEncryptionPaddings("NoPadding").build());
+                            kg.generateKey();
+                        }
+                        if (!rawApiKey.isEmpty()) {
+                            javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+                            c.init(javax.crypto.Cipher.ENCRYPT_MODE, (javax.crypto.SecretKey) ks.getKey("dsh_apikey", null));
+                            byte[] enc = c.doFinal(rawApiKey.getBytes("UTF-8"));
+                            byte[] iv = c.getIV();
+                            byte[] out = new byte[iv.length + enc.length];
+                            System.arraycopy(iv, 0, out, 0, iv.length);
+                            System.arraycopy(enc, 0, out, iv.length, enc.length);
+                            encApiKey = android.util.Base64.encodeToString(out, android.util.Base64.NO_WRAP);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                    editor.putString("apiKey", encApiKey);
+                }
                 if (request.has("shareStorage")) editor.putBoolean("shareStorage", request.optBoolean("shareStorage", true));
                 if (request.has("keepAwake")) editor.putBoolean("keepAwake", request.optBoolean("keepAwake", true));
                 if (request.has("autoRestart")) editor.putBoolean("autoRestart", request.optBoolean("autoRestart", true));
@@ -622,7 +653,23 @@ public final class BridgeServer {
 
             JSONObject settings = new JSONObject();
             settings.put("port", app.port());
-            settings.put("apiKey", app.prefs.getString("apiKey", ""));
+            {
+                String storedApiKey = app.prefs.getString("apiKey", "");
+                String plainApiKey = "";
+                try {
+                    if (!storedApiKey.isEmpty()) {
+                        byte[] data = android.util.Base64.decode(storedApiKey, android.util.Base64.NO_WRAP);
+                        java.security.KeyStore ks = java.security.KeyStore.getInstance("AndroidKeyStore");
+                        ks.load(null);
+                        javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+                        c.init(javax.crypto.Cipher.DECRYPT_MODE, (javax.crypto.SecretKey) ks.getKey("dsh_apikey", null),
+                                new javax.crypto.spec.GCMParameterSpec(128, data, 0, 12));
+                        plainApiKey = new String(c.doFinal(data, 12, data.length - 12), "UTF-8");
+                    }
+                } catch (Exception ignored) {
+                }
+                settings.put("apiKey", plainApiKey);
+            }
             settings.put("shareStorage", app.prefs.getBoolean("shareStorage", true));
             settings.put("keepAwake", app.prefs.getBoolean("keepAwake", true));
             settings.put("chromeMode", app.prefs.getString("window_chrome_mode", "auto"));
